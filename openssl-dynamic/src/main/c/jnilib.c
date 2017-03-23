@@ -30,15 +30,11 @@
  */
 
 #include "tcn.h"
-#include "apr_version.h"
-#include "apr_atomic.h"
-#include "apr_strings.h"
 
 #ifndef TCN_JNI_VERSION
 #define TCN_JNI_VERSION JNI_VERSION_1_4
 #endif
 
-apr_pool_t *tcn_global_pool = NULL;
 static JavaVM     *tcn_global_vm = NULL;
 
 static jclass    jString_class;
@@ -53,26 +49,12 @@ static jfieldID  keyMaterialPrivateKeyFieldId;
 JNIEXPORT jint JNICALL JNI_OnLoad_netty_tcnative(JavaVM *vm, void *reserved) 
 {
     JNIEnv *env;
-    apr_version_t apv;
-    int apvn;
 
     UNREFERENCED(reserved);
     if ((*vm)->GetEnv(vm, (void **)&env, TCN_JNI_VERSION)) {
         return JNI_ERR;
     }
     tcn_global_vm = vm;
-
-    /* Before doing anything else check if we have a valid
-     * APR version.
-     */
-    apr_version(&apv);
-    apvn = apv.major * 1000 + apv.minor * 100 + apv.patch;
-    if (apvn < 1201) {
-        tcn_Throw(env, "Unsupported APR version (%s)",
-                  apr_version_string());
-        return JNI_ERR;
-    }
-
 
     /* Initialize global java.lang.String class */
     TCN_LOAD_CLASS(env, jString_class, "java/lang/String", JNI_ERR);
@@ -114,13 +96,12 @@ JNIEXPORT void JNICALL JNI_OnUnload_netty_tcnative(JavaVM *vm, void *reserved)
     if ((*vm)->GetEnv(vm, (void **)&env, TCN_JNI_VERSION)) {
         return;
     }
-    if (tcn_global_pool) {
-        TCN_UNLOAD_CLASS(env, jString_class);
-        apr_terminate();
-    }
-
+    TCN_UNLOAD_CLASS(env, jString_class);
     TCN_UNLOAD_CLASS(env, byteArrayClass);
     TCN_UNLOAD_CLASS(env, keyMaterialClass);
+
+    // Unload everything that is related to SSL
+    tcn_ssl_unload();
 }
 
 /* Called by the JVM before the APR_JAVA is unloaded */
@@ -155,45 +136,6 @@ jstring tcn_new_string(JNIEnv *env, const char *str)
         return NULL;
     else
         return (*env)->NewStringUTF(env, str);
-}
-
-TCN_IMPLEMENT_CALL(jboolean, Library, initialize0)(TCN_STDARGS)
-{
-
-    UNREFERENCED_STDARGS;
-    if (!tcn_global_pool) {
-        apr_initialize();
-        if (apr_pool_create(&tcn_global_pool, NULL) != APR_SUCCESS) {
-            return JNI_FALSE;
-        }
-        apr_atomic_init(tcn_global_pool);
-    }
-    return JNI_TRUE;
-}
-
-TCN_IMPLEMENT_CALL(jint, Library, aprMajorVersion)(TCN_STDARGS)
-{
-    apr_version_t apv;
-
-    UNREFERENCED_STDARGS;
-    apr_version(&apv);
-    return apv.major;
-}
-
-TCN_IMPLEMENT_CALL(jstring, Library, aprVersionString)(TCN_STDARGS)
-{
-    UNREFERENCED(o);
-    return AJP_TO_JSTRING(apr_version_string());
-}
-
-TCN_IMPLEMENT_CALL(jboolean, Library, aprHasThreads)(TCN_STDARGS)
-{
-    UNREFERENCED_STDARGS;
-#if APR_HAS_THREADS
-    return JNI_TRUE;
-#else
-    return JNI_FALSE;
-#endif
 }
 
 jclass tcn_get_string_class()

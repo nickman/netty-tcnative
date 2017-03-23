@@ -48,8 +48,9 @@
 #define OPENSSL_NO_RC5
 #endif
 
-#include "apr_thread_rwlock.h"
-#include "apr_atomic.h"
+#include "tcn_atomic.h"
+#include "tcn_lock_rw.h"
+
 #include <stdbool.h>
 
 /* OpenSSL headers */
@@ -184,7 +185,7 @@ struct tcn_ssl_ctxt_t {
     /* for client or downstream server authentication */
     char*                    password;
 
-    apr_thread_rwlock_t*     mutex; // Session ticket mutext
+    tcn_lock_rw_t            ticket_keys_lock; // Session ticket lock
     tcn_ssl_ticket_key_t*    ticket_keys;
 
     /* certificate verifier callback */
@@ -212,13 +213,13 @@ struct tcn_ssl_ctxt_t {
     /* TLS ticket key session resumption statistics */
 
     // The client did not present a ticket and we issued a new one.
-    apr_uint32_t             ticket_keys_new;
+    tcn_atomic_uint32_t             ticket_keys_new;
     // The client presented a ticket derived from the primary key
-    apr_uint32_t             ticket_keys_resume;
+    tcn_atomic_uint32_t             ticket_keys_resume;
     // The client presented a ticket derived from an older key, and we upgraded to the primary key.
-    apr_uint32_t             ticket_keys_renew;
+    tcn_atomic_uint32_t             ticket_keys_renew;
     // The client presented a ticket that did not match any key in the list.
-    apr_uint32_t             ticket_keys_fail;
+    tcn_atomic_uint32_t            ticket_keys_fail;
 
     unsigned char            context_id[SHA_DIGEST_LENGTH];
 };

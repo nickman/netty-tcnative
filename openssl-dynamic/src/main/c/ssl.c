@@ -29,31 +29,24 @@
  * limitations under the License.
  */
 
+#include <string.h>
 #include <stdbool.h>
 #include <openssl/bio.h>
 #include "tcn.h"
-#include "apr_file_io.h"
-#include "apr_thread_mutex.h"
-#include "apr_atomic.h"
-#include "apr_strings.h"
-#include "apr_portable.h"
+#include "tcn_lock.h"
+#include "tcn_thread.h"
 #include "ssl_private.h"
 
 static int ssl_initialized = 0;
-extern apr_pool_t *tcn_global_pool;
 
 ENGINE *tcn_ssl_engine = NULL;
 void *SSL_temp_keys[SSL_TMP_KEY_MAX];
 
-/* Global reference to the pool used by the dynamic mutexes */
-static apr_pool_t *dynlockpool = NULL;
-
 /* Dynamic lock structure */
 struct CRYPTO_dynlock_value {
-    apr_pool_t *pool;
     const char* file;
     int line;
-    apr_thread_mutex_t *mutex;
+    tcn_lock_t mutex;
 };
 
 struct TCN_bio_bytebuffer {
@@ -541,15 +534,11 @@ TCN_IMPLEMENT_CALL(jstring, SSL, versionString)(TCN_STDARGS)
     return AJP_TO_JSTRING(OpenSSL_version(OPENSSL_VERSION));
 }
 
-/*
- *  the various processing hooks
- */
-static apr_status_t ssl_init_cleanup(void *data)
-{
-    UNREFERENCED(data);
 
+static bool ssl_init_cleanup()
+{
     if (!ssl_initialized)
-        return APR_SUCCESS;
+        return false;
     ssl_initialized = 0;
 
     SSL_TMP_KEYS_FREE(DH);
@@ -578,16 +567,7 @@ static apr_status_t ssl_init_cleanup(void *data)
     free_bio_methods();
 #endif
 
-    /* Don't call ERR_free_strings here; ERR_load_*_strings only
-     * actually load the error strings once per process due to static
-     * variable abuse in OpenSSL. */
-
-    /*
-     * TODO: determine somewhere we can safely shove out diagnostics
-     *       (when enabled) at this late stage in the game:
-     * CRYPTO_mem_leaks_fp(stderr);
-     */
-    return APR_SUCCESS;
+    return true;
 }
 
 #ifndef OPENSSL_NO_ENGINE
@@ -610,7 +590,7 @@ static ENGINE *ssl_try_load_engine(const char *engine)
  * To ensure thread-safetyness in OpenSSL
  */
 
-static apr_thread_mutex_t **ssl_lock_cs;
+static tcn_lock_t **ssl_lock_cs;
 static int                  ssl_lock_num_locks;
 
 static void ssl_thread_lock(int mode, int type,
@@ -620,10 +600,10 @@ static void ssl_thread_lock(int mode, int type,
     UNREFERENCED(line);
     if (type < ssl_lock_num_locks) {
         if (mode & CRYPTO_LOCK) {
-            apr_thread_mutex_lock(ssl_lock_cs[type]);
+            tcn_lock_acquire(ssl_lock_cs[type]);
         }
         else {
-            apr_thread_mutex_unlock(ssl_lock_cs[type]);
+            tcn_lock_release(ssl_lock_cs[type]);
         }
     }
 }
@@ -644,7 +624,7 @@ static unsigned long ssl_thread_id(void)
 #elif defined(WIN32)
     return (unsigned long)GetCurrentThreadId();
 #else
-    return (unsigned long)(apr_os_thread_current());
+    return (unsigned long)(tcn_current_thread_id());
 #endif
 }
 
@@ -653,20 +633,13 @@ static void ssl_set_thread_id(CRYPTO_THREADID *id)
     CRYPTO_THREADID_set_numeric(id, ssl_thread_id());
 }
 
-static apr_status_t ssl_thread_cleanup(void *data)
+static void ssl_thread_cleanup()
 {
-    UNREFERENCED(data);
     CRYPTO_set_locking_callback(NULL);
     CRYPTO_THREADID_set_callback(NULL);
     CRYPTO_set_dynlock_create_callback(NULL);
     CRYPTO_set_dynlock_lock_callback(NULL);
     CRYPTO_set_dynlock_destroy_callback(NULL);
-
-    dynlockpool = NULL;
-
-    /* Let the registered mutex cleanups do their own thing
-     */
-    return APR_SUCCESS;
 }
 
 /*
@@ -676,39 +649,20 @@ static struct CRYPTO_dynlock_value *ssl_dyn_create_function(const char *file,
                                                      int line)
 {
     struct CRYPTO_dynlock_value *value;
-    apr_pool_t *p;
-    apr_status_t rv;
-
-    /*
-     * We need a pool to allocate our mutex.  Since we can't clear
-     * allocated memory from a pool, create a subpool that we can blow
-     * away in the destruction callback.
-     */
-    rv = apr_pool_create(&p, dynlockpool);
-    if (rv != APR_SUCCESS) {
-        /* TODO log that fprintf(stderr, "Failed to create subpool for dynamic lock"); */
-        return NULL;
-    }
-
-    value = (struct CRYPTO_dynlock_value *)apr_palloc(p,
+    value = (struct CRYPTO_dynlock_value *)OPENSSL_malloc(
                                                       sizeof(struct CRYPTO_dynlock_value));
+
     if (!value) {
         /* TODO log that fprintf(stderr, "Failed to allocate dynamic lock structure"); */
         return NULL;
     }
 
-    value->pool = p;
     /* Keep our own copy of the place from which we were created,
        using our own pool. */
-    value->file = apr_pstrdup(p, file);
+    value->file = strdup(file);
     value->line = line;
-    rv = apr_thread_mutex_create(&(value->mutex), APR_THREAD_MUTEX_DEFAULT,
-                                p);
-    if (rv != APR_SUCCESS) {
-        /* TODO log that fprintf(stderr, "Failed to create thread mutex for dynamic lock"); */
-        apr_pool_destroy(p);
-        return NULL;
-    }
+    value->mutex = tcn_lock_new();
+
     return value;
 }
 
@@ -719,10 +673,10 @@ static void ssl_dyn_lock_function(int mode, struct CRYPTO_dynlock_value *l,
                            const char *file, int line)
 {
     if (mode & CRYPTO_LOCK) {
-        apr_thread_mutex_lock(l->mutex);
+        tcn_lock_acquire(l->mutex);
     }
     else {
-        apr_thread_mutex_unlock(l->mutex);
+        tcn_lock_release(l->mutex);
     }
 }
 
@@ -732,43 +686,30 @@ static void ssl_dyn_lock_function(int mode, struct CRYPTO_dynlock_value *l,
 static void ssl_dyn_destroy_function(struct CRYPTO_dynlock_value *l,
                           const char *file, int line)
 {
-    apr_status_t rv;
-    rv = apr_thread_mutex_destroy(l->mutex);
-    if (rv != APR_SUCCESS) {
-        /* TODO log that fprintf(stderr, "Failed to destroy mutex for dynamic lock %s:%d", l->file, l->line); */
-    }
+    free((void *) l->file);
 
-    /* Trust that whomever owned the CRYPTO_dynlock_value we were
-     * passed has no future use for it...
-     */
-    apr_pool_destroy(l->pool);
+    tcn_lock_free(l->mutex);
+
+    OPENSSL_free(l);
 }
 
-static void ssl_thread_setup(apr_pool_t *p)
+static void ssl_thread_setup()
 {
     int i;
 
     ssl_lock_num_locks = CRYPTO_num_locks();
-    ssl_lock_cs = apr_palloc(p, ssl_lock_num_locks * sizeof(*ssl_lock_cs));
+    ssl_lock_cs = OPENSSL_malloc(ssl_lock_num_locks * sizeof(*ssl_lock_cs));
 
     for (i = 0; i < ssl_lock_num_locks; i++) {
-        apr_thread_mutex_create(&(ssl_lock_cs[i]),
-                                APR_THREAD_MUTEX_DEFAULT, p);
+        ssl_lock_cs[i] = tcn_lock_new();
     }
 
     CRYPTO_THREADID_set_callback(ssl_set_thread_id);
     CRYPTO_set_locking_callback(ssl_thread_lock);
 
-    /* Set up dynamic locking scaffolding for OpenSSL to use at its
-     * convenience.
-     */
-    dynlockpool = p;
     CRYPTO_set_dynlock_create_callback(ssl_dyn_create_function);
     CRYPTO_set_dynlock_lock_callback(ssl_dyn_lock_function);
     CRYPTO_set_dynlock_destroy_callback(ssl_dyn_destroy_function);
-
-    apr_pool_cleanup_register(p, NULL, ssl_thread_cleanup,
-                              apr_pool_cleanup_null);
 }
 
 TCN_IMPLEMENT_CALL(jint, SSL, initialize)(TCN_STDARGS, jstring engine)
@@ -778,23 +719,19 @@ TCN_IMPLEMENT_CALL(jint, SSL, initialize)(TCN_STDARGS, jstring engine)
     TCN_ALLOC_CSTRING(engine);
 
     UNREFERENCED(o);
-    if (!tcn_global_pool) {
-        TCN_FREE_CSTRING(engine);
-        tcn_ThrowAPRException(e, APR_EINVAL);
-        return (jint)APR_EINVAL;
-    }
+
     /* Check if already initialized */
     if (ssl_initialized++) {
         TCN_FREE_CSTRING(engine);
-        return (jint)APR_SUCCESS;
+        return 0;
     }
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
     if (SSLeay() < 0x0090700L) {
         TCN_FREE_CSTRING(engine);
-        tcn_ThrowAPRException(e, APR_EINVAL);
+        tcn_ThrowException(e, "openssl version too old");
         ssl_initialized = 0;
-        return (jint)APR_EINVAL;
+        return -1;
     }
 #endif
 
@@ -817,35 +754,35 @@ TCN_IMPLEMENT_CALL(jint, SSL, initialize)(TCN_STDARGS, jstring engine)
 #endif
 
     /* Initialize thread support */
-    ssl_thread_setup(tcn_global_pool);
+    ssl_thread_setup();
 
 #ifndef OPENSSL_NO_ENGINE
     if (J2S(engine)) {
         ENGINE *ee = NULL;
-        apr_status_t err = APR_SUCCESS;
+        int err = 0;
         if(strcmp(J2S(engine), "auto") == 0) {
             ENGINE_register_all_complete();
         }
         else {
             if ((ee = ENGINE_by_id(J2S(engine))) == NULL
                 && (ee = ssl_try_load_engine(J2S(engine))) == NULL)
-                err = APR_ENOTIMPL;
+                err = -1;
             else {
 #ifdef ENGINE_CTRL_CHIL_SET_FORKCHECK
                 if (strcmp(J2S(engine), "chil") == 0)
                     ENGINE_ctrl(ee, ENGINE_CTRL_CHIL_SET_FORKCHECK, 1, 0, 0);
 #endif
                 if (!ENGINE_set_default(ee, ENGINE_METHOD_ALL))
-                    err = APR_ENOTIMPL;
+                    err = -1;
             }
             /* Free our "structural" reference. */
             if (ee)
                 ENGINE_free(ee);
         }
-        if (err != APR_SUCCESS) {
+        if (err != 0) {
             TCN_FREE_CSTRING(engine);
-            ssl_init_cleanup(NULL);
-            tcn_ThrowAPRException(e, err);
+            ssl_init_cleanup();
+            tcn_ThrowException(e, "Unable to init SSL");
             return (jint)err;
         }
         tcn_ssl_engine = ee;
@@ -863,19 +800,13 @@ TCN_IMPLEMENT_CALL(jint, SSL, initialize)(TCN_STDARGS, jstring engine)
     if (r) {
         ERR_clear_error();
         TCN_FREE_CSTRING(engine);
-        ssl_init_cleanup(NULL);
-        tcn_ThrowAPRException(e, APR_ENOTIMPL);
-        return APR_ENOTIMPL;
+        ssl_init_cleanup();
+        tcn_ThrowException(e, "Unable to init SSL");
+        return -1;
     }
-    /*
-     * Let us cleanup the ssl library when the library is unloaded
-     */
-    apr_pool_cleanup_register(tcn_global_pool, NULL,
-                              ssl_init_cleanup,
-                              apr_pool_cleanup_null);
     TCN_FREE_CSTRING(engine);
 
-    return (jint)APR_SUCCESS;
+    return 0;
 }
 
 TCN_IMPLEMENT_CALL(jlong, SSL, newMemBIO)(TCN_STDARGS)
@@ -1987,3 +1918,8 @@ TCN_IMPLEMENT_CALL(void, SSL, freeX509Chain)(TCN_STDARGS, jlong x509Chain)
     sk_X509_pop_free(chain, X509_free);
 }
 
+void tcn_ssl_unload() {
+    if (ssl_init_cleanup()) {
+        ssl_thread_cleanup();
+    }
+}
